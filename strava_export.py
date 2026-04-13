@@ -35,7 +35,6 @@ AUTH_URL = "https://www.strava.com/oauth/authorize"
 TOKEN_URL = "https://www.strava.com/oauth/token"
 API_BASE = "https://www.strava.com/api/v3"
 
-MONTHS_BACK = 18
 STREAM_COUNT = 15  # Recent runs to pull streams for
 
 
@@ -311,12 +310,9 @@ def main():
     token = get_token()
     print("Authenticated.\n")
 
-    # Calculate date cutoff
-    cutoff = datetime.now() - timedelta(days=int(MONTHS_BACK * 30.44))
-    print(f"Fetching activities since {cutoff.strftime('%Y-%m-%d')}...")
-
-    # Fetch and filter
-    all_activities = fetch_all_activities(token, cutoff.timestamp())
+    # Fetch all activities (no date cutoff)
+    print("Fetching all activities...")
+    all_activities = fetch_all_activities(token, 0)
     runs = [a for a in all_activities if a.get("type") == "Run"]
     soccer = [a for a in all_activities if a.get("type") in ("Soccer", "Football")]
     print(f"Found {len(all_activities)} activities total: {len(runs)} runs, {len(soccer)} soccer\n")
