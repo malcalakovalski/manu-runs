@@ -6,3 +6,8 @@ strava_tokens.json
 __pycache__/
 *.pyc
 .venv/
+
+# Quarto build artifacts
+dashboard.html
+dashboard_files/
+*_files/

@@ -1,0 +1,511 @@
+---
+title: "Running Progress"
+date: now
+date-format: "MMMM D, YYYY h:mm A"
+format:
+  dashboard:
+    theme: darkly
+    orientation: rows
+    self-contained: true
+---
+
+```{python}
+#| include: false
+
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from pathlib import Path
+import warnings
+warnings.filterwarnings("ignore")
+
+# ── Configuration ────────────────────────────────────────────────
+# Adjust these to match your HR zones and goals.
+
+ZONE2_LOW = 120            # Zone 2 HR lower bound (bpm)
+ZONE2_HIGH = 150           # Zone 2 HR upper bound (bpm)
+MIN_MONTHLY_MILES = 25     # Minimum effective training month
+TARGET_MONTHLY_MILES = 50  # Target monthly mileage
+ROLLING_SHORT = 30         # Short rolling window (days)
+ROLLING_LONG = 90          # Long rolling window (days)
+
+# 10K readiness scorecard thresholds
+MILEAGE_GREEN = 30         # 30-day mileage green threshold
+MILEAGE_YELLOW = 20        # 30-day mileage yellow threshold
+PACE_GREEN = 13.0          # Zone 2 pace green (min/mi, lower = better)
+PACE_YELLOW = 14.5         # Zone 2 pace yellow
+STREAK_GREEN = 3           # Month streak green threshold
+STREAK_YELLOW = 1          # Month streak yellow threshold
+
+DATA_DIR = Path("data")
+STREAMS_DIR = DATA_DIR / "activity-streams"
+
+# ── Helpers ──────────────────────────────────────────────────────
+
+def parse_pace(pace_str):
+    """Convert 'M:SS' pace string to decimal minutes."""
+    if not pace_str or (isinstance(pace_str, float) and np.isnan(pace_str)):
+        return np.nan
+    parts = str(pace_str).split(":")
+    if len(parts) != 2:
+        return np.nan
+    try:
+        return int(parts[0]) + int(parts[1]) / 60
+    except ValueError:
+        return np.nan
+
+def format_pace(minutes):
+    """Convert decimal minutes to 'M:SS' string."""
+    if pd.isna(minutes):
+        return "--"
+    m = int(minutes)
+    s = int(round((minutes - m) * 60))
+    if s == 60:
+        m += 1
+        s = 0
+    return f"{m}:{s:02d}"
+
+def traffic_light(value, green_thresh, yellow_thresh, lower_is_better=False):
+    """Return Quarto valuebox color string."""
+    if pd.isna(value):
+        return "secondary"
+    if lower_is_better:
+        if value <= green_thresh:
+            return "success"
+        elif value <= yellow_thresh:
+            return "warning"
+        return "danger"
+    else:
+        if value >= green_thresh:
+            return "success"
+        elif value >= yellow_thresh:
+            return "warning"
+        return "danger"
+
+# ── Load Data ────────────────────────────────────────────────────
+
+runs = pd.read_csv(DATA_DIR / "strava-runs-summary.csv")
+runs["date"] = pd.to_datetime(runs["date"])
+runs["pace_numeric"] = runs["avg_pace_per_mile"].apply(parse_pace)
+runs["month"] = runs["date"].dt.to_period("M")
+
+soccer = pd.read_csv(DATA_DIR / "strava-soccer-summary.csv")
+soccer["date"] = pd.to_datetime(soccer["date"])
+soccer["month"] = soccer["date"].dt.to_period("M")
+
+# ── Zone 2 Pace Calculation ─────────────────────────────────────
+# Stream-based (precise): filter per-second data to zone 2 HR, average pace.
+# Estimate (fallback): for runs without streams where avg HR is in zone 2,
+# use avg_pace_per_mile as a proxy.
+
+z2_records = []
+stream_files = sorted(STREAMS_DIR.glob("*.csv")) if STREAMS_DIR.exists() else []
+stream_activity_ids = set()
+
+for f in stream_files:
+    parts = f.stem.split("-")
+    activity_id = int(parts[-1])
+    run_date = pd.Timestamp(f"{parts[0]}-{parts[1]}-{parts[2]}")
+    stream_activity_ids.add(activity_id)
+
+    sdf = pd.read_csv(f)
+    sdf["heartrate"] = pd.to_numeric(sdf["heartrate"], errors="coerce")
+    sdf["pace_numeric"] = sdf["pace_per_mile"].apply(parse_pace)
+
+    z2 = sdf[
+        (sdf["heartrate"] >= ZONE2_LOW)
+        & (sdf["heartrate"] <= ZONE2_HIGH)
+        & sdf["pace_numeric"].notna()
+        & (sdf["pace_numeric"] > 0)
+        & (sdf["pace_numeric"] < 20)
+    ]
+
+    if len(z2) >= 30:
+        z2_records.append({
+            "date": run_date,
+            "z2_pace": z2["pace_numeric"].mean(),
+            "z2_seconds": len(z2),
+            "source": "stream",
+        })
+
+for _, row in runs.iterrows():
+    aid = row.get("activity_id")
+    if pd.notna(aid) and int(aid) in stream_activity_ids:
+        continue
+    if (
+        pd.notna(row["avg_heartrate"])
+        and ZONE2_LOW <= row["avg_heartrate"] <= ZONE2_HIGH
+        and pd.notna(row["pace_numeric"])
+        and 5 < row["pace_numeric"] < 20
+    ):
+        z2_records.append({
+            "date": row["date"],
+            "z2_pace": row["pace_numeric"],
+            "z2_seconds": row.get("duration_seconds", 0),
+            "source": "estimate",
+        })
+
+z2_df = pd.DataFrame(z2_records) if z2_records else pd.DataFrame(
+    columns=["date", "z2_pace", "z2_seconds", "source"]
+)
+z2_monthly = pd.Series(dtype=float)
+if not z2_df.empty:
+    z2_df["date"] = pd.to_datetime(z2_df["date"])
+    z2_df["month"] = z2_df["date"].dt.to_period("M")
+    z2_monthly = z2_df.groupby("month")["z2_pace"].mean()
+
+# ── Monthly Volume ───────────────────────────────────────────────
+
+all_months = pd.period_range(
+    start=runs["date"].min(), end=runs["date"].max(), freq="M"
+)
+run_monthly = (
+    runs.groupby("month")["distance_miles"].sum().reindex(all_months, fill_value=0)
+)
+soccer_monthly = soccer.groupby("month").size().reindex(all_months, fill_value=0)
+
+# ── Month Streak (consecutive months >= MIN_MONTHLY_MILES) ──────
+
+streak = 0
+for m in reversed(all_months):
+    if run_monthly.get(m, 0) >= MIN_MONTHLY_MILES:
+        streak += 1
+    else:
+        break
+
+# ── Rolling Mileage ──────────────────────────────────────────────
+
+daily_runs_dict = runs.groupby(runs["date"].dt.date)["distance_miles"].sum().to_dict()
+date_range = pd.date_range(
+    start=runs["date"].min().normalize(),
+    end=runs["date"].max().normalize(),
+    freq="D",
+)
+daily = pd.DataFrame({"date": date_range})
+daily["miles"] = daily["date"].map(lambda d: daily_runs_dict.get(d.date(), 0))
+daily["rolling_30d"] = daily["miles"].rolling(ROLLING_SHORT, min_periods=1).sum()
+daily["rolling_90d"] = daily["miles"].rolling(ROLLING_LONG, min_periods=1).sum()
+
+# ── Cardiac Drift ────────────────────────────────────────────────
+
+drift_records = []
+for f in stream_files:
+    parts = f.stem.split("-")
+    run_date = pd.Timestamp(f"{parts[0]}-{parts[1]}-{parts[2]}")
+
+    sdf = pd.read_csv(f)
+    sdf["heartrate"] = pd.to_numeric(sdf["heartrate"], errors="coerce")
+    sdf["pace_numeric"] = sdf["pace_per_mile"].apply(parse_pace)
+
+    running = sdf[
+        sdf["heartrate"].notna()
+        & sdf["pace_numeric"].notna()
+        & (sdf["pace_numeric"] > 0)
+        & (sdf["pace_numeric"] < 20)
+    ]
+
+    if len(running) < 120:
+        continue
+
+    mid = len(running) // 2
+    hr_first = running.iloc[:mid]["heartrate"].mean()
+    hr_second = running.iloc[mid:]["heartrate"].mean()
+
+    if hr_first > 0:
+        drift_records.append({
+            "date": run_date,
+            "drift_pct": round((hr_second - hr_first) / hr_first * 100, 1),
+        })
+
+drift_df = pd.DataFrame(drift_records) if drift_records else pd.DataFrame(
+    columns=["date", "drift_pct"]
+)
+if not drift_df.empty:
+    drift_df["date"] = pd.to_datetime(drift_df["date"])
+
+# ── Scorecard Metrics ────────────────────────────────────────────
+
+current_30d = daily["rolling_30d"].iloc[-1] if len(daily) > 0 else 0
+
+if not z2_df.empty:
+    recent_z2 = z2_df.sort_values("date", ascending=False).head(3)["z2_pace"].mean()
+else:
+    recent_z2 = np.nan
+```
+
+## Row {height="15%"}
+
+```{python}
+#| content: valuebox
+#| title: "30-Day Mileage"
+dict(
+    icon="speedometer2",
+    color=traffic_light(current_30d, MILEAGE_GREEN, MILEAGE_YELLOW),
+    value=f"{current_30d:.1f} mi",
+)
+```
+
+```{python}
+#| content: valuebox
+#| title: "Zone 2 Pace (last 3 runs)"
+dict(
+    icon="heart-pulse",
+    color=traffic_light(recent_z2, PACE_GREEN, PACE_YELLOW, lower_is_better=True),
+    value=format_pace(recent_z2) + " /mi",
+)
+```
+
+```{python}
+#| content: valuebox
+#| title: "Month Streak (≥25 mi)"
+dict(
+    icon="calendar-check",
+    color=traffic_light(streak, STREAK_GREEN, STREAK_YELLOW),
+    value=f"{streak} mo",
+)
+```
+
+## Row {height="35%"}
+
+### Zone 2 Pace Efficiency
+
+```{python}
+fig = go.Figure()
+
+if not z2_df.empty:
+    estimates = z2_df[z2_df["source"] == "estimate"]
+    streams_pts = z2_df[z2_df["source"] == "stream"]
+
+    if not estimates.empty:
+        fig.add_trace(go.Scatter(
+            x=estimates["date"], y=estimates["z2_pace"],
+            mode="markers",
+            name="Estimated (avg HR in zone 2)",
+            marker=dict(size=6, color="rgba(255,255,255,0.25)"),
+            text=estimates["z2_pace"].apply(format_pace),
+            hovertemplate="%{x|%b %d, %Y}<br>Pace: %{text}<extra></extra>",
+        ))
+
+    if not streams_pts.empty:
+        fig.add_trace(go.Scatter(
+            x=streams_pts["date"], y=streams_pts["z2_pace"],
+            mode="markers",
+            name="Stream-based (precise)",
+            marker=dict(size=9, color="#00d4aa", symbol="diamond"),
+            text=streams_pts["z2_pace"].apply(format_pace),
+            hovertemplate="%{x|%b %d, %Y}<br>Pace: %{text}<extra></extra>",
+        ))
+
+    if not z2_monthly.empty:
+        monthly_x = z2_monthly.index.to_timestamp() + pd.Timedelta(days=15)
+        fig.add_trace(go.Scatter(
+            x=monthly_x, y=z2_monthly.values,
+            mode="lines+markers",
+            name="Monthly average",
+            line=dict(color="#00d4aa", width=3),
+            marker=dict(size=11),
+            text=[format_pace(p) for p in z2_monthly.values],
+            hovertemplate="%{x|%b %Y}<br>Avg: %{text}<extra></extra>",
+        ))
+
+if not z2_df.empty:
+    y_lo = int(z2_df["z2_pace"].min()) - 1
+    y_hi = int(z2_df["z2_pace"].max()) + 2
+else:
+    y_lo, y_hi = 8, 18
+
+fig.update_layout(
+    template="plotly_dark",
+    yaxis=dict(
+        title="Pace (min/mi)",
+        autorange="reversed",
+        tickvals=list(range(y_lo, y_hi + 1)),
+        ticktext=[f"{m}:00" for m in range(y_lo, y_hi + 1)],
+    ),
+    xaxis_title="",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    margin=dict(t=40, b=50, l=60, r=20),
+    hovermode="closest",
+    annotations=[dict(
+        text="Faster is up. Dots = individual runs, line = monthly average.",
+        xref="paper", yref="paper", x=0.01, y=0.01,
+        showarrow=False, font=dict(size=11, color="rgba(255,255,255,0.35)"),
+    )],
+)
+fig
+```
+
+## Row {height="25%"}
+
+### Monthly Volume + Consistency
+
+```{python}
+fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+month_labels = [m.start_time.strftime("%b '%y") for m in all_months]
+
+streak_start_idx = max(0, len(all_months) - streak) if streak > 0 else len(all_months)
+bar_colors = []
+for i, m in enumerate(all_months):
+    miles = run_monthly.get(m, 0)
+    in_streak = streak > 0 and i >= streak_start_idx
+    if miles >= TARGET_MONTHLY_MILES:
+        bar_colors.append("#00d4aa")
+    elif miles >= MIN_MONTHLY_MILES and in_streak:
+        bar_colors.append("#4dabf7")
+    elif miles >= MIN_MONTHLY_MILES:
+        bar_colors.append("rgba(77,171,247,0.4)")
+    else:
+        bar_colors.append("rgba(255,255,255,0.12)")
+
+fig.add_trace(
+    go.Bar(
+        x=month_labels, y=run_monthly.values,
+        name="Running miles", marker_color=bar_colors,
+        hovertemplate="%{x}<br>%{y:.1f} mi<extra></extra>",
+    ),
+    secondary_y=False,
+)
+
+fig.add_trace(
+    go.Scatter(
+        x=month_labels, y=soccer_monthly.values,
+        mode="lines+markers", name="Soccer sessions",
+        line=dict(color="orange", width=2),
+        marker=dict(size=5, color="orange"),
+        hovertemplate="%{x}<br>%{y} sessions<extra></extra>",
+    ),
+    secondary_y=True,
+)
+
+fig.add_hline(
+    y=MIN_MONTHLY_MILES, line_dash="dash",
+    line_color="rgba(255,255,0,0.3)",
+    annotation_text=f"{MIN_MONTHLY_MILES} mi min",
+    annotation_position="top left", secondary_y=False,
+)
+fig.add_hline(
+    y=TARGET_MONTHLY_MILES, line_dash="dash",
+    line_color="rgba(0,212,170,0.3)",
+    annotation_text=f"{TARGET_MONTHLY_MILES} mi target",
+    annotation_position="top left", secondary_y=False,
+)
+
+if streak > 0:
+    mid_idx = len(all_months) - (streak + 1) // 2
+    fig.add_annotation(
+        x=month_labels[mid_idx],
+        y=max(run_monthly.values) * 1.08,
+        text=f"{streak}-month streak",
+        showarrow=False,
+        font=dict(size=12, color="#4dabf7", weight="bold"),
+    )
+
+fig.update_layout(
+    template="plotly_dark",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    margin=dict(t=40, b=50),
+    xaxis=dict(tickangle=-45),
+    hovermode="x",
+)
+fig.update_yaxes(title_text="Miles", secondary_y=False)
+fig.update_yaxes(title_text="Sessions", secondary_y=True, showgrid=False)
+fig
+```
+
+### Rolling Mileage
+
+```{python}
+fig = go.Figure()
+
+fig.add_trace(go.Scatter(
+    x=daily["date"], y=daily["rolling_90d"],
+    mode="lines", name=f"{ROLLING_LONG}-day",
+    line=dict(color="#ff6b6b", width=2),
+    hovertemplate="%{x|%b %d, %Y}<br>%{y:.1f} mi<extra></extra>",
+))
+
+fig.add_trace(go.Scatter(
+    x=daily["date"], y=daily["rolling_30d"],
+    mode="lines", name=f"{ROLLING_SHORT}-day",
+    line=dict(color="#4dabf7", width=2),
+    hovertemplate="%{x|%b %d, %Y}<br>%{y:.1f} mi<extra></extra>",
+))
+
+building = daily["rolling_30d"] >= daily["rolling_90d"]
+changes = building.ne(building.shift()).cumsum()
+for seg_id in changes.unique():
+    mask = changes == seg_id
+    seg = daily[mask]
+    if len(seg) < 2:
+        continue
+    fig.add_vrect(
+        x0=seg["date"].iloc[0], x1=seg["date"].iloc[-1],
+        fillcolor="rgba(0,212,170,0.07)" if building[mask].iloc[0] else "rgba(255,107,107,0.07)",
+        line_width=0, layer="below",
+    )
+
+fig.update_layout(
+    template="plotly_dark",
+    yaxis_title="Miles",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    margin=dict(t=40, b=60),
+    hovermode="x unified",
+    annotations=[dict(
+        text="Green = building (30d > 90d). Red = declining.",
+        xref="paper", yref="paper", x=0.5, y=-0.15,
+        showarrow=False, font=dict(size=11, color="rgba(255,255,255,0.35)"),
+    )],
+)
+fig
+```
+
+## Row {height="25%"}
+
+### Cardiac Drift Analysis
+
+```{python}
+fig = go.Figure()
+
+if not drift_df.empty:
+    fig.add_trace(go.Scatter(
+        x=drift_df["date"], y=drift_df["drift_pct"],
+        mode="markers+lines", name="Cardiac drift",
+        marker=dict(size=10, color="#ff6b6b"),
+        line=dict(color="rgba(255,107,107,0.4)", width=1),
+        hovertemplate="%{x|%b %d, %Y}<br>Drift: %{y:.1f}%<extra></extra>",
+    ))
+
+    if len(drift_df) >= 3:
+        x_num = drift_df["date"].astype("int64") / 1e18
+        z = np.polyfit(x_num, drift_df["drift_pct"], 1)
+        p = np.poly1d(z)
+        fig.add_trace(go.Scatter(
+            x=drift_df["date"], y=p(x_num),
+            mode="lines", name="Trend",
+            line=dict(color="#4dabf7", width=2, dash="dash"),
+        ))
+
+    fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.2)")
+else:
+    fig.add_annotation(
+        x=0.5, y=0.5, xref="paper", yref="paper",
+        text="No stream data available for drift analysis",
+        showarrow=False, font=dict(size=14, color="rgba(255,255,255,0.5)"),
+    )
+
+fig.update_layout(
+    template="plotly_dark",
+    yaxis_title="Drift %",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    margin=dict(t=40, b=60),
+    hovermode="closest",
+    annotations=[dict(
+        text="Drift = (2nd-half HR - 1st-half HR) / 1st-half HR. Lower = better aerobic fitness.",
+        xref="paper", yref="paper", x=0.5, y=-0.15,
+        showarrow=False, font=dict(size=11, color="rgba(255,255,255,0.35)"),
+    )],
+)
+fig
+```
