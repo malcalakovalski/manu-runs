@@ -7,6 +7,7 @@ format:
     theme: darkly
     orientation: rows
     self-contained: true
+    scrolling: true
 ---
 
 ```{python}
@@ -234,7 +235,7 @@ else:
     recent_z2 = np.nan
 ```
 
-## Row {height="15%"}
+## Row
 
 ```{python}
 #| content: valuebox
@@ -266,7 +267,7 @@ dict(
 )
 ```
 
-## Row {height="35%"}
+## Row
 
 ### Zone 2 Pace Efficiency
 
@@ -317,12 +318,17 @@ else:
 
 fig.update_layout(
     template="plotly_dark",
+    height=450,
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
     yaxis=dict(
         title="Pace (min/mi)",
         autorange="reversed",
         tickvals=list(range(y_lo, y_hi + 1)),
         ticktext=[f"{m}:00" for m in range(y_lo, y_hi + 1)],
+        gridcolor="rgba(255,255,255,0.08)",
     ),
+    xaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
     xaxis_title="",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     margin=dict(t=40, b=50, l=60, r=20),
@@ -336,7 +342,7 @@ fig.update_layout(
 fig
 ```
 
-## Row {height="25%"}
+## Row
 
 ### Monthly Volume + Consistency
 
@@ -404,12 +410,15 @@ if streak > 0:
 
 fig.update_layout(
     template="plotly_dark",
+    height=400,
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    margin=dict(t=40, b=50),
-    xaxis=dict(tickangle=-45),
+    margin=dict(t=40, b=60),
+    xaxis=dict(tickangle=-45, gridcolor="rgba(255,255,255,0.08)"),
     hovermode="x",
 )
-fig.update_yaxes(title_text="Miles", secondary_y=False)
+fig.update_yaxes(title_text="Miles", secondary_y=False, gridcolor="rgba(255,255,255,0.08)")
 fig.update_yaxes(title_text="Sessions", secondary_y=True, showgrid=False)
 fig
 ```
@@ -448,7 +457,11 @@ for seg_id in changes.unique():
 
 fig.update_layout(
     template="plotly_dark",
-    yaxis_title="Miles",
+    height=400,
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    yaxis=dict(title="Miles", gridcolor="rgba(255,255,255,0.08)"),
+    xaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     margin=dict(t=40, b=60),
     hovermode="x unified",
@@ -461,7 +474,7 @@ fig.update_layout(
 fig
 ```
 
-## Row {height="25%"}
+## Row
 
 ### Cardiac Drift Analysis
 
@@ -497,7 +510,11 @@ else:
 
 fig.update_layout(
     template="plotly_dark",
-    yaxis_title="Drift %",
+    height=400,
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    yaxis=dict(title="Drift %", gridcolor="rgba(255,255,255,0.08)"),
+    xaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     margin=dict(t=40, b=60),
     hovermode="closest",
