@@ -1,4 +1,5 @@
 date,name,distance_miles,duration,duration_seconds,avg_pace_per_mile,avg_heartrate,max_heartrate,elevation_gain_ft,hr_zone_1_sec,hr_zone_2_sec,hr_zone_3_sec,hr_zone_4_sec,hr_zone_5_sec,activity_id
+2026-05-03 12:29,Lunch Run,3.42,49:33,2973,14:29,145.8,167.0,137.8,483.0,2469.0,8.0,0.0,0.0,18363137518
 2026-05-01 18:18,Evening Run,3.7,53:41,3221,14:30,139.6,167.0,52.5,1073.0,2132.0,5.0,0.0,0.0,18339029206
 2026-04-29 10:37,Morning Run,3.7,53:28,3208,14:27,133.7,160.0,72.2,1225.0,1965.0,0.0,0.0,0.0,18307390797
 2026-04-27 13:26,St James Park Run,2.79,38:35,2315,13:50,148.3,172.0,88.6,343.0,1874.0,92.0,0.0,0.0,18278234834
