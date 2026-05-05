@@ -32,6 +32,8 @@ MIN_MONTHLY_MILES = 25     # Minimum effective training month
 TARGET_MONTHLY_MILES = 50  # Target monthly mileage
 ROLLING_SHORT = 30         # Short rolling window (days)
 ROLLING_LONG = 90          # Long rolling window (days)
+REFERENCE_PACE = 14.0          # Reference pace for HR tracking (min/mi) — update as fitness improves
+REFERENCE_PACE_BAND = 0.5      # ± band around reference pace (min)
 
 # 10K readiness scorecard thresholds
 MILEAGE_GREEN = 30         # 30-day mileage green threshold
@@ -267,6 +269,77 @@ drift_df = pd.DataFrame(drift_records) if drift_records else pd.DataFrame(
 if not drift_df.empty:
     drift_df["date"] = pd.to_datetime(drift_df["date"])
 
+# ── Pace-HR Relationship ────────────────────────────────────────
+
+ref_pace_records = []
+scatter_chunks = []
+
+for f in stream_files:
+    parts = f.stem.split("-")
+    run_date = pd.Timestamp(f"{parts[0]}-{parts[1]}-{parts[2]}")
+
+    sdf = pd.read_csv(f)
+    sdf["heartrate"] = pd.to_numeric(sdf["heartrate"], errors="coerce")
+    sdf["pace_numeric"] = sdf["pace_per_mile"].apply(parse_pace)
+
+    valid = sdf[
+        sdf["heartrate"].notna()
+        & (sdf["heartrate"] > 0)
+        & sdf["pace_numeric"].notna()
+        & (sdf["pace_numeric"] > 5)
+        & (sdf["pace_numeric"] < 25)
+    ].copy()
+
+    if len(valid) < 60:
+        continue
+
+    in_band = valid[
+        (valid["pace_numeric"] >= REFERENCE_PACE - REFERENCE_PACE_BAND)
+        & (valid["pace_numeric"] <= REFERENCE_PACE + REFERENCE_PACE_BAND)
+    ]
+    if len(in_band) >= 30:
+        ref_pace_records.append({
+            "date": run_date,
+            "median_hr": in_band["heartrate"].median(),
+            "n_seconds": len(in_band),
+        })
+
+    valid["chunk"] = np.arange(len(valid)) // 30
+    downsampled = valid.groupby("chunk").agg(
+        pace=("pace_numeric", "mean"),
+        hr=("heartrate", "mean"),
+    ).reset_index(drop=True)
+    downsampled["date"] = run_date
+    scatter_chunks.append(downsampled)
+
+ref_pace_df = pd.DataFrame(ref_pace_records) if ref_pace_records else pd.DataFrame(
+    columns=["date", "median_hr", "n_seconds"]
+)
+if not ref_pace_df.empty:
+    ref_pace_df["date"] = pd.to_datetime(ref_pace_df["date"])
+
+scatter_df = pd.concat(scatter_chunks, ignore_index=True) if scatter_chunks else pd.DataFrame(
+    columns=["pace", "hr", "date"]
+)
+if not scatter_df.empty:
+    scatter_df["date"] = pd.to_datetime(scatter_df["date"])
+
+pace_adj_df = pd.DataFrame(columns=["date", "predicted_hr"])
+pace_adj_bpm_month = np.nan
+if not scatter_df.empty and len(scatter_df) >= 30:
+    _d0 = scatter_df["date"].min()
+    scatter_df["date_days"] = (scatter_df["date"] - _d0).dt.days
+    _X = np.column_stack([
+        np.ones(len(scatter_df)),
+        scatter_df["pace"].values,
+        scatter_df["date_days"].values,
+    ])
+    _beta = np.linalg.lstsq(_X, scatter_df["hr"].values, rcond=None)[0]
+    _rd = scatter_df.groupby("date")["date_days"].first().reset_index()
+    _rd["predicted_hr"] = _beta[0] + _beta[1] * REFERENCE_PACE + _beta[2] * _rd["date_days"]
+    pace_adj_df = _rd[["date", "predicted_hr"]].copy()
+    pace_adj_bpm_month = _beta[2] * 30
+
 # ── Scorecard Metrics ────────────────────────────────────────────
 
 current_30d = daily["rolling_30d"].iloc[-1] if len(daily) > 0 else 0
@@ -373,6 +446,187 @@ fig.update_layout(**chart_layout(
         xref="paper", yref="paper", x=0, y=-0.08,
         showarrow=False, font=dict(size=12, color="rgba(255,255,255,0.4)"),
     )],
+))
+fig.show()
+```
+
+## HR at Reference Pace
+
+```{python}
+#| echo: false
+
+fig = go.Figure()
+
+chart_annotations = [dict(
+    text=(
+        f"Median HR during seconds at {format_pace(REFERENCE_PACE)}/mi "
+        f"(\u00b1{format_pace(REFERENCE_PACE_BAND)}). Declining = improving aerobic fitness."
+    ),
+    xref="paper", yref="paper", x=0.5, y=-0.1,
+    showarrow=False, font=dict(size=12, color="rgba(255,255,255,0.4)"),
+)]
+
+if not ref_pace_df.empty:
+    fig.add_trace(go.Scatter(
+        x=ref_pace_df["date"], y=ref_pace_df["median_hr"],
+        mode="markers", name="Median HR",
+        marker=dict(size=10, color="#ff6b6b", opacity=0.8),
+        customdata=ref_pace_df["n_seconds"],
+        hovertemplate="%{x|%b %d, %Y}<br>Median HR: %{y:.0f} bpm<br>%{customdata} sec at pace<extra></extra>",
+    ))
+
+    if len(ref_pace_df) >= 3:
+        x_num = ref_pace_df["date"].astype("int64") / 1e18
+        z = np.polyfit(x_num, ref_pace_df["median_hr"], 1)
+        trend_y = np.poly1d(z)(x_num.values)
+        fig.add_trace(go.Scatter(
+            x=ref_pace_df["date"], y=trend_y,
+            mode="lines", name="Trend",
+            line=dict(color="#4dabf7", width=2, dash="dash"),
+        ))
+        days_span = (ref_pace_df["date"].max() - ref_pace_df["date"].min()).days
+        if days_span > 0:
+            change = (trend_y[-1] - trend_y[0]) / (days_span / 30)
+            arrow = "\u2193" if change < 0 else "\u2191"
+            chart_annotations.append(dict(
+                x=ref_pace_df["date"].iloc[len(ref_pace_df) // 2],
+                y=ref_pace_df["median_hr"].max() + 3,
+                text=f"{arrow} {abs(change):.1f} bpm/month",
+                showarrow=False, font=dict(size=14, color="#4dabf7"),
+            ))
+else:
+    chart_annotations.append(dict(
+        x=0.5, y=0.5, xref="paper", yref="paper",
+        text="No stream data with sufficient seconds at reference pace",
+        showarrow=False, font=dict(size=14, color="rgba(255,255,255,0.5)"),
+    ))
+
+fig.update_layout(**chart_layout(
+    height=500,
+    yaxis=dict(title="Heart Rate (bpm)", gridcolor=GRID_COLOR),
+    xaxis=dict(gridcolor=GRID_COLOR),
+    hovermode="closest",
+    annotations=chart_annotations,
+))
+fig.show()
+```
+
+## Pace vs. Heart Rate by Month
+
+```{python}
+#| echo: false
+
+fig = go.Figure()
+
+chart_annotations = [dict(
+    text="Each dot = 30-sec avg. If clouds shift DOWN over months at the same pace, fitness is improving.",
+    xref="paper", yref="paper", x=0.5, y=-0.1,
+    showarrow=False, font=dict(size=12, color="rgba(255,255,255,0.4)"),
+)]
+
+if not scatter_df.empty:
+    months_ordered = sorted(scatter_df["date"].dt.to_period("M").unique())
+    palette = ["#ff6b6b", "#ffc107", "#00d4aa", "#4dabf7", "#a855f7", "#f97316"]
+
+    for i, m in enumerate(months_ordered):
+        mask = scatter_df["date"].dt.to_period("M") == m
+        chunk = scatter_df[mask]
+        color = palette[i % len(palette)]
+        label = m.strftime("%b '%y")
+
+        fig.add_trace(go.Scatter(
+            x=chunk["pace"], y=chunk["hr"],
+            mode="markers", name=label,
+            marker=dict(size=4, color=color, opacity=0.3),
+            hovertemplate=f"{label}<br>Pace: %{{x:.1f}} min/mi<br>HR: %{{y:.0f}} bpm<extra></extra>",
+        ))
+
+        if len(chunk) >= 10:
+            z = np.polyfit(chunk["pace"], chunk["hr"], 1)
+            pace_range = np.linspace(chunk["pace"].min(), chunk["pace"].max(), 50)
+            fig.add_trace(go.Scatter(
+                x=pace_range, y=np.poly1d(z)(pace_range),
+                mode="lines", name=f"{label} trend",
+                line=dict(color=color, width=2),
+                showlegend=False, hoverinfo="skip",
+            ))
+
+    fig.add_vline(
+        x=REFERENCE_PACE, line_dash="dash",
+        line_color="rgba(255,255,255,0.4)",
+    )
+    chart_annotations.append(dict(
+        x=REFERENCE_PACE, y=1.02, xref="x", yref="paper",
+        text=f"Ref: {format_pace(REFERENCE_PACE)}/mi",
+        showarrow=False, font=dict(size=11, color="rgba(255,255,255,0.5)"),
+    ))
+
+fig.update_layout(**chart_layout(
+    height=500,
+    xaxis=dict(title="Pace (min/mi)", autorange="reversed", gridcolor=GRID_COLOR),
+    yaxis=dict(title="Heart Rate (bpm)", gridcolor=GRID_COLOR),
+    hovermode="closest",
+    annotations=chart_annotations,
+))
+fig.show()
+```
+
+## Pace-Adjusted HR Trend
+
+```{python}
+#| echo: false
+
+fig = go.Figure()
+
+chart_annotations = [dict(
+    text=(
+        f"Linear model (HR ~ pace + date) predicts HR at {format_pace(REFERENCE_PACE)}/mi. "
+        "Controls for pace variation across runs."
+    ),
+    xref="paper", yref="paper", x=0.5, y=-0.1,
+    showarrow=False, font=dict(size=12, color="rgba(255,255,255,0.4)"),
+)]
+
+if not pace_adj_df.empty:
+    fig.add_trace(go.Scatter(
+        x=pace_adj_df["date"], y=pace_adj_df["predicted_hr"],
+        mode="markers+lines",
+        name=f"Predicted HR at {format_pace(REFERENCE_PACE)}/mi",
+        marker=dict(size=10, color="#00d4aa"),
+        line=dict(color="rgba(0,212,170,0.4)", width=1),
+        hovertemplate="%{x|%b %d, %Y}<br>Predicted HR: %{y:.0f} bpm<extra></extra>",
+    ))
+
+    if len(pace_adj_df) >= 3:
+        x_num = pace_adj_df["date"].astype("int64") / 1e18
+        z = np.polyfit(x_num, pace_adj_df["predicted_hr"], 1)
+        fig.add_trace(go.Scatter(
+            x=pace_adj_df["date"], y=np.poly1d(z)(x_num.values),
+            mode="lines", name="Trend",
+            line=dict(color="#4dabf7", width=2, dash="dash"),
+        ))
+
+    if not np.isnan(pace_adj_bpm_month):
+        arrow = "\u2193" if pace_adj_bpm_month < 0 else "\u2191"
+        chart_annotations.append(dict(
+            x=pace_adj_df["date"].iloc[len(pace_adj_df) // 2],
+            y=pace_adj_df["predicted_hr"].max() + 2,
+            text=f"{arrow} {abs(pace_adj_bpm_month):.1f} bpm/month (model)",
+            showarrow=False, font=dict(size=14, color="#4dabf7"),
+        ))
+else:
+    chart_annotations.append(dict(
+        x=0.5, y=0.5, xref="paper", yref="paper",
+        text="Insufficient stream data for pace-adjusted model",
+        showarrow=False, font=dict(size=14, color="rgba(255,255,255,0.5)"),
+    ))
+
+fig.update_layout(**chart_layout(
+    height=500,
+    yaxis=dict(title="Predicted Heart Rate (bpm)", gridcolor=GRID_COLOR),
+    xaxis=dict(gridcolor=GRID_COLOR),
+    hovermode="closest",
+    annotations=chart_annotations,
 ))
 fig.show()
 ```
