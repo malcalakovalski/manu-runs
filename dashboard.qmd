@@ -324,7 +324,7 @@ scatter_df = pd.concat(scatter_chunks, ignore_index=True) if scatter_chunks else
 if not scatter_df.empty:
     scatter_df["date"] = pd.to_datetime(scatter_df["date"])
 
-pace_adj_df = pd.DataFrame(columns=["date", "predicted_hr"])
+pace_adj_df = pd.DataFrame(columns=["date", "adjusted_hr", "model_hr"])
 pace_adj_bpm_month = np.nan
 if not scatter_df.empty and len(scatter_df) >= 30:
     _d0 = scatter_df["date"].min()
@@ -335,10 +335,18 @@ if not scatter_df.empty and len(scatter_df) >= 30:
         scatter_df["date_days"].values,
     ])
     _beta = np.linalg.lstsq(_X, scatter_df["hr"].values, rcond=None)[0]
-    _rd = scatter_df.groupby("date")["date_days"].first().reset_index()
-    _rd["predicted_hr"] = _beta[0] + _beta[1] * REFERENCE_PACE + _beta[2] * _rd["date_days"]
-    pace_adj_df = _rd[["date", "predicted_hr"]].copy()
+    scatter_df["_resid"] = scatter_df["hr"] - (
+        _beta[0] + _beta[1] * scatter_df["pace"] + _beta[2] * scatter_df["date_days"]
+    )
+    _rd = scatter_df.groupby("date").agg(
+        date_days=("date_days", "first"),
+        mean_resid=("_resid", "mean"),
+    ).reset_index()
+    _rd["model_hr"] = _beta[0] + _beta[1] * REFERENCE_PACE + _beta[2] * _rd["date_days"]
+    _rd["adjusted_hr"] = _rd["model_hr"] + _rd["mean_resid"]
+    pace_adj_df = _rd[["date", "adjusted_hr", "model_hr"]].copy()
     pace_adj_bpm_month = _beta[2] * 30
+    scatter_df.drop(columns=["_resid"], inplace=True)
 
 # ── Scorecard Metrics ────────────────────────────────────────────
 
@@ -589,28 +597,24 @@ chart_annotations = [dict(
 
 if not pace_adj_df.empty:
     fig.add_trace(go.Scatter(
-        x=pace_adj_df["date"], y=pace_adj_df["predicted_hr"],
-        mode="markers+lines",
-        name=f"Predicted HR at {format_pace(REFERENCE_PACE)}/mi",
-        marker=dict(size=10, color="#00d4aa"),
-        line=dict(color="rgba(0,212,170,0.4)", width=1),
-        hovertemplate="%{x|%b %d, %Y}<br>Predicted HR: %{y:.0f} bpm<extra></extra>",
+        x=pace_adj_df["date"], y=pace_adj_df["adjusted_hr"],
+        mode="markers",
+        name="Per-run adjusted HR",
+        marker=dict(size=10, color="#00d4aa", opacity=0.7),
+        hovertemplate="%{x|%b %d, %Y}<br>Adjusted HR: %{y:.0f} bpm<extra></extra>",
     ))
 
-    if len(pace_adj_df) >= 3:
-        x_num = pace_adj_df["date"].astype("int64") / 1e18
-        z = np.polyfit(x_num, pace_adj_df["predicted_hr"], 1)
-        fig.add_trace(go.Scatter(
-            x=pace_adj_df["date"], y=np.poly1d(z)(x_num.values),
-            mode="lines", name="Trend",
-            line=dict(color="#4dabf7", width=2, dash="dash"),
-        ))
+    fig.add_trace(go.Scatter(
+        x=pace_adj_df["date"], y=pace_adj_df["model_hr"],
+        mode="lines", name="Model trend",
+        line=dict(color="#4dabf7", width=2, dash="dash"),
+    ))
 
     if not np.isnan(pace_adj_bpm_month):
         arrow = "\u2193" if pace_adj_bpm_month < 0 else "\u2191"
         chart_annotations.append(dict(
             x=pace_adj_df["date"].iloc[len(pace_adj_df) // 2],
-            y=pace_adj_df["predicted_hr"].max() + 2,
+            y=pace_adj_df["adjusted_hr"].max() + 2,
             text=f"{arrow} {abs(pace_adj_bpm_month):.1f} bpm/month (model)",
             showarrow=False, font=dict(size=14, color="#4dabf7"),
         ))
